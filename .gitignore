@@ -1,0 +1,8 @@
+# Secret files - NEVER upload these
+.env
+credentials.json
+
+# Python junk files
+__pycache__/
+*.pyc
+.vscode/
