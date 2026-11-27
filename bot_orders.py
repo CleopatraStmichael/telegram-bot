@@ -6,18 +6,25 @@ that ALSO takes orders and saves them to a Google Sheet.
 import os
 import json
 import re
+from io import BytesIO
+from urllib.parse import quote
 from datetime import datetime, timedelta
 
 import gspread
 from dotenv import load_dotenv
 from groq import Groq
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
 # --- 1. Keys and connections ---
 load_dotenv()
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 WHATSAPP_LINK = os.environ["WHATSAPP_LINK"]
+BANK_NAME = os.environ["BANK_NAME"]
+ACCOUNT_NAME = os.environ["ACCOUNT_NAME"]
+ACCOUNT_NUMBER = os.environ["ACCOUNT_NUMBER"]
 client = Groq(api_key=os.environ["GROQ_API_KEY"])
 MODEL = "openai/gpt-oss-120b"  # bigger free model: better at maths and tools
 
@@ -92,9 +99,12 @@ If the customer ADDS to or CHANGES an order that was already saved, call calcula
 COMPLETE new order (old items + new items), confirm it, then call save_order again with the COMPLETE
 order. This updates their existing order; it does not create a second one.
 If nothing changed, do not call save_order again.
-After saving, tell them the order is received, give them the hair total, and ask them to
-tap our WhatsApp link to get the delivery fee and bank details, make payment, and send their receipt there.
-Always include the WhatsApp link in that message.
+If the customer just says thank you, okay, alright, noted, or similar after their order is saved,
+do NOT call any tool. Just reply warmly, e.g. "You're welcome, Queen! 👑 We'll take it from here on WhatsApp.
+If you need anything else, just let us know." 
+After saving, reply with ONE short, warm sentence thanking them (e.g. "Thank you Queen, your order is in! 👑").
+Do NOT repeat the order, total, bank details or WhatsApp link: the system automatically sends
+the order summary, bank details, WhatsApp button and invoice right after your message.
 
 {BUSINESS_INFO}"""
 
@@ -214,14 +224,32 @@ def save_order(name, phone, items, address, telegram_user="", user_data=None, cu
         existing = sheet.row_values(row)
         digits = lambda p: re.sub(r"\D", "", str(p))[-7:]   # compare the last 7 digits only
         same_row = len(existing) >= 3 and digits(existing[2]) == digits(user_data.get("order_phone"))
+    # Details used for the summary message and the invoice
+    order = {
+        "name": name, "phone": phone, "address": address, "date": now.strftime("%d %b %Y, %I:%M %p"),
+        "items": [(line.split(" x ")[1].split(" = ")[0], int(line.split(" x ")[0])) for line in lines],
+        "total": total, "bundles": total_bundles,
+    }
+
+    # If nothing changed since the last save, don't save (or send the invoice) again
+    last = user_data.get("last_order")
+    simple = lambda t: re.sub(r"[^a-z0-9]", "", str(t).lower())     # ignore spaces, commas, capitals
+    same_address = last and (simple(last["address"]) in simple(address) or simple(address) in simple(last["address"]))
+    same_phone = last and re.sub(r"\D", "", str(last["phone"]))[-7:] == re.sub(r"\D", "", str(phone))[-7:]
+    if last and sorted(last["items"]) == sorted(order["items"]) and same_phone and same_address:
+        print(f"ℹ️ No change to order {user_data.get('order_id')}, not saved again")
+        return "NO CHANGE: this exact order is already saved. Do not call save_order again; just reply kindly."
+
     if same_row:
-        sheet.update(range_name=f"A{row}:I{row}", values=[[
+        order["id"] = user_data.get("order_id") or f"KC{row:04d}"
+        sheet.update(range_name=f"A{row}:J{row}", values=[[
             now.strftime("%Y-%m-%d %H:%M"),
-            name, phone, items_text, total_bundles, total, address, telegram_user, "New (updated)",
+            name, phone, items_text, total_bundles, total, address, telegram_user, "New (updated)", order["id"],
         ]])
         user_data["order_time"] = now
         user_data["order_phone"] = str(phone)
-        print(f"✏️ Order UPDATED (row {row}): {name} - {items_text} = N{total:,}")
+        user_data["last_order"] = order
+        print(f"✏️ Order UPDATED ({order['id']}, row {row}): {name} - {items_text} = N{total:,}")
         return f"ORDER UPDATED: {items_text}. New total for hair: N{total:,} (delivery fee not included)."
 
     # Otherwise add a NEW row, and remember which row it is
@@ -231,11 +259,145 @@ def save_order(name, phone, items, address, telegram_user="", user_data=None, cu
     ])
     match = re.search(r"![A-Z]+(\d+)", str((result or {}).get("updates", {}).get("updatedRange", "")))
     if match:
-        user_data["order_row"] = int(match.group(1))
+        row = int(match.group(1))
+        order["id"] = f"KC{row:04d}"          # e.g. KC0007 (based on the row number)
+        sheet.update(range_name=f"J{row}", values=[[order["id"]]])
+        user_data["order_row"] = row
         user_data["order_time"] = now
         user_data["order_phone"] = str(phone)
-    print(f"✅ Order saved: {name} - {items_text} = N{total:,}")
+    else:
+        order["id"] = "KC" + now.strftime("%m%d%H%M")
+    user_data["order_id"] = order["id"]
+    user_data["last_order"] = order
+    print(f"✅ Order saved ({order['id']}): {name} - {items_text} = N{total:,}")
     return f"ORDER SAVED: {items_text}. Total for hair: N{total:,} (delivery fee not included)."
+
+
+# --- 3b. After an order: summary + bank details + WhatsApp button + PDF invoice ---
+def whatsapp_link_with_order(order):
+    """A WhatsApp link that opens a chat with the order summary already typed in."""
+    lines = "\n".join(f"- {qty} x {product}" for product, qty in order["items"])
+    text = (
+        f"Hello Kikiscurls and Co! 👋\n"
+        f"I just placed an order on Telegram.\n\n"
+        f"Order ID: {order['id']}\n"
+        f"Name: {order['name']}\n"
+        f"Phone: {order['phone']}\n"
+        f"Address: {order['address']}\n\n"
+        f"Items:\n{lines}\n\n"
+        f"Total for hair: N{order['total']:,}\n\n"
+        f"Please send the delivery fee. I'll send my payment receipt here."
+    )
+    return WHATSAPP_LINK.split("?")[0] + "?text=" + quote(text)
+
+
+def order_summary_text(order):
+    lines = "\n".join(f"• {qty} x {product} = N{PRICES[product] * qty:,}" for product, qty in order["items"])
+    return (
+        f"🧾 ORDER SUMMARY ({order['id']})\n\n"
+        f"{lines}\n\n"
+        f"Total for hair: N{order['total']:,}\n"
+        f"Delivery fee: to be confirmed on WhatsApp\n\n"
+        f"💳 PAYMENT DETAILS (bank transfer)\n"
+        f"Bank: {BANK_NAME}\n"
+        f"Account name: {ACCOUNT_NAME}\n"
+        f"Account number: {ACCOUNT_NUMBER}\n\n"
+        f"👇 Tap the button below to send your order to us on WhatsApp. "
+        f"We'll confirm your delivery fee, then send your payment receipt there with your Order ID."
+    )
+
+
+def make_invoice(order):
+    """Builds a one-page PDF invoice and returns it as bytes."""
+    buffer = BytesIO()
+    pdf = canvas.Canvas(buffer, pagesize=A4)
+    width, height = A4
+    left, right = 50, width - 50
+    y = height - 60
+
+    # Header
+    pdf.setFont("Helvetica-Bold", 20)
+    pdf.drawString(left, y, "Kikiscurls and Co")
+    pdf.setFont("Helvetica-Bold", 16)
+    pdf.drawRightString(right, y, "INVOICE")
+    y -= 18
+    pdf.setFont("Helvetica", 10)
+    pdf.drawString(left, y, "Braiding hair extensions  |  Online store  |  Nationwide delivery")
+    y -= 30
+
+    # Invoice info and customer
+    pdf.setFont("Helvetica-Bold", 11)
+    pdf.drawString(left, y, "Billed to:")
+    pdf.drawRightString(right, y, f"Invoice no: {order['id']}")
+    pdf.setFont("Helvetica", 11)
+    for i, text in enumerate([order["name"], order["phone"], order["address"]]):
+        pdf.drawString(left, y - 16 * (i + 1), str(text)[:70])
+    pdf.drawRightString(right, y - 16, f"Date: {order['date']}")
+    pdf.drawRightString(right, y - 32, "Status: UNPAID")
+    y -= 80
+
+    # Items table
+    pdf.setFont("Helvetica-Bold", 11)
+    pdf.drawString(left, y, "Item")
+    pdf.drawRightString(330, y, "Bundles")
+    pdf.drawRightString(430, y, "Price/bundle")
+    pdf.drawRightString(right, y, "Amount")
+    y -= 6
+    pdf.line(left, y, right, y)
+    pdf.setFont("Helvetica", 11)
+    for product, qty in order["items"]:
+        y -= 20
+        pdf.drawString(left, y, product)
+        pdf.drawRightString(330, y, str(qty))
+        pdf.drawRightString(430, y, f"N{PRICES[product]:,}")
+        pdf.drawRightString(right, y, f"N{PRICES[product] * qty:,}")
+    y -= 10
+    pdf.line(left, y, right, y)
+
+    # Totals
+    y -= 22
+    pdf.setFont("Helvetica", 11)
+    pdf.drawRightString(430, y, "Subtotal (hair):")
+    pdf.drawRightString(right, y, f"N{order['total']:,}")
+    y -= 18
+    pdf.drawRightString(430, y, "Delivery fee:")
+    pdf.drawRightString(right, y, "To be confirmed")
+    y -= 22
+    pdf.setFont("Helvetica-Bold", 12)
+    pdf.drawRightString(430, y, "Total due (excl. delivery):")
+    pdf.drawRightString(right, y, f"N{order['total']:,}")
+
+    # Payment details
+    y -= 50
+    pdf.setFont("Helvetica-Bold", 11)
+    pdf.drawString(left, y, "Payment details (bank transfer only)")
+    pdf.setFont("Helvetica", 11)
+    for i, text in enumerate([f"Bank: {BANK_NAME}", f"Account name: {ACCOUNT_NAME}",
+                              f"Account number: {ACCOUNT_NUMBER}"]):
+        pdf.drawString(left, y - 16 * (i + 1), text)
+    y -= 80
+    pdf.setFont("Helvetica-Oblique", 10)
+    pdf.drawString(left, y, f"Please send your payment receipt on WhatsApp with your invoice number ({order['id']}).")
+    pdf.drawString(left, y - 14, "Delivery: 2-3 business days within Lagos. Other states confirmed on WhatsApp.")
+    pdf.drawString(left, y - 28, "Thank you for shopping with Kikiscurls and Co!")
+
+    pdf.showPage()
+    pdf.save()
+    return buffer.getvalue()
+
+
+async def send_order_extras(update: Update, order):
+    """Sends the summary with bank details, a WhatsApp button, and the PDF invoice."""
+    button = InlineKeyboardMarkup([[InlineKeyboardButton(
+        "📲 Send my order on WhatsApp", url=whatsapp_link_with_order(order))]])
+    await update.message.reply_text(order_summary_text(order), reply_markup=button)
+    try:
+        await update.message.reply_document(
+            document=make_invoice(order), filename=f"Invoice-{order['id']}.pdf",
+            caption=f"Your invoice for order {order['id']} 🧾",
+        )
+    except Exception as e:
+        print("Invoice error:", e)
 
 
 def clean(text):
@@ -313,6 +475,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("order_row", None)   # a fresh chat starts a fresh order
     context.user_data.pop("order_time", None)
     context.user_data.pop("order_phone", None)
+    context.user_data.pop("order_id", None)
+    context.user_data.pop("last_order", None)
+    context.user_data.pop("last_sent", None)
     await update.message.reply_text(
         "Hey Queen 👑 Welcome to Kikiscurls and Co 💇🏾‍♀️\n"
         "We've got you covered with French curls, Italian curls and bone straight extensions. "
@@ -344,6 +509,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         history.append({"role": "system", "content": "Record: " + note})
     history.append({"role": "assistant", "content": reply})
     await update.message.reply_text(reply)
+
+    # If an order was just saved or updated: send summary, bank details, WhatsApp button and invoice
+    # (but never send the exact same summary twice)
+    order = context.user_data.get("last_order")
+    if notes and order:
+        key = (order["id"], tuple(sorted(order["items"])), re.sub(r"[^a-z0-9]", "", str(order["address"]).lower()))
+        if context.user_data.get("last_sent") != key:
+            await send_order_extras(update, order)
+            context.user_data["last_sent"] = key
 
 
 async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
