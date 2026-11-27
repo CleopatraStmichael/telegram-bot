@@ -185,7 +185,7 @@ def calculate_total(items):
     return "; ".join(lines) + f". TOTAL for hair: N{total:,} (delivery fee not included)."
 
 
-def save_order(name, phone, items, address, telegram_user="", user_data=None, customer_text=""):
+def save_order(name, phone, items, address, telegram_user="", user_data=None, customer_text="", chat_id=""):
     # Check the details first, so empty or fake orders are never saved
     lines, total, total_bundles, missing = check_items(items)
     if len(str(name).strip()) < 2 or "?" in str(name):
@@ -242,9 +242,10 @@ def save_order(name, phone, items, address, telegram_user="", user_data=None, cu
 
     if same_row:
         order["id"] = user_data.get("order_id") or f"KC{row:04d}"
-        sheet.update(range_name=f"A{row}:J{row}", values=[[
+        sheet.update(range_name=f"A{row}:K{row}", values=[[
             now.strftime("%Y-%m-%d %H:%M"),
             name, phone, items_text, total_bundles, total, address, telegram_user, "New (updated)", order["id"],
+            str(chat_id),
         ]])
         user_data["order_time"] = now
         user_data["order_phone"] = str(phone)
@@ -256,6 +257,7 @@ def save_order(name, phone, items, address, telegram_user="", user_data=None, cu
     result = sheet.append_row([
         now.strftime("%Y-%m-%d %H:%M"),
         name, phone, items_text, total_bundles, total, address, telegram_user, "New",
+        "", str(chat_id),     # J = Order ID (filled in below), K = Chat ID (so we can message them later)
     ])
     match = re.search(r"![A-Z]+(\d+)", str((result or {}).get("updates", {}).get("updatedRange", "")))
     if match:
@@ -406,7 +408,7 @@ def clean(text):
 
 
 # --- 4. Ask the AI, and run any tools it asks for ---
-def ask_ai(history, telegram_user, user_data, customer_text=""):
+def ask_ai(history, telegram_user, user_data, customer_text="", chat_id=""):
     """Returns (reply, notes). Notes record saved orders so the bot remembers them."""
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
     notes = []
@@ -454,7 +456,7 @@ def ask_ai(history, telegram_user, user_data, customer_text=""):
                     else:
                         result = save_order(merged.get("name"), merged.get("phone"),
                                             merged.get("items"), merged.get("address"),
-                                            telegram_user, user_data, customer_text)
+                                            telegram_user, user_data, customer_text, chat_id)
                         if result.startswith("ORDER"):
                             notes.append(result)
                 else:
@@ -494,7 +496,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for attempt in range(2):  # if the AI service hiccups, try once more
         try:
             customer_text = " ".join(m["content"] for m in history if m["role"] == "user")
-            reply, notes = ask_ai(history[-14:], telegram_user, context.user_data, customer_text)
+            reply, notes = ask_ai(history[-14:], telegram_user, context.user_data, customer_text,
+                                  update.effective_chat.id)
             break
         except Exception as e:
             print(f"AI error (attempt {attempt + 1}):", e)
@@ -533,6 +536,38 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(reply)
 
 
+# --- 5b. Watch the sheet: when you change Status, message the customer automatically ---
+STATUS_MESSAGES = {
+    "paid": "Hey Queen 👑 Payment received for order {id}! 🎉 Thank you. "
+            "Your order is now being processed and we'll let you know when it's on its way.",
+    "shipped": "Good news, Queen! 🚚 Your order {id} is on its way to you. "
+               "Delivery takes 2-3 business days within Lagos; other states as confirmed on WhatsApp.",
+    "delivered": "Your order {id} has been delivered! 💇🏾‍♀️ Thank you for shopping with Kikiscurls and Co. "
+                 "We'd love to see your hairstyle, so feel free to share a picture with us on WhatsApp: " + WHATSAPP_LINK,
+}
+
+
+async def check_status_updates(context: ContextTypes.DEFAULT_TYPE):
+    """Runs every minute. Columns: I = Status, J = Order ID, K = Chat ID, L = Notified (last status we messaged)."""
+    try:
+        rows = sheet.get_all_values()
+    except Exception as e:
+        print("Could not read sheet:", e)
+        return
+    for number, row in enumerate(rows[1:], start=2):     # skip the header row
+        row = row + [""] * (12 - len(row))               # make sure columns I to L exist
+        status = row[8].strip().lower()
+        order_id, chat_id, notified = row[9], row[10].strip(), row[11].strip().lower()
+        if status in STATUS_MESSAGES and chat_id and notified != status:
+            try:
+                await context.bot.send_message(chat_id=int(chat_id),
+                                               text=STATUS_MESSAGES[status].format(id=order_id or "your order"))
+                sheet.update(range_name=f"L{number}", values=[[status.capitalize()]])
+                print(f"📣 Told {row[1]} their order {order_id} is {status}")
+            except Exception as e:
+                print(f"Could not message {row[1]} about order {order_id}:", e)
+
+
 # --- 6. Start the bot ---
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
@@ -541,6 +576,7 @@ def main():
     media = (filters.PHOTO | filters.VIDEO | filters.VOICE | filters.AUDIO
              | filters.Document.ALL | filters.Sticker.ALL)
     app.add_handler(MessageHandler(media, handle_media))
+    app.job_queue.run_repeating(check_status_updates, interval=60, first=10)   # check the sheet every minute
     print("Bot is running (with Google Sheets orders)... press Ctrl+C to stop.")
     app.run_polling()
 

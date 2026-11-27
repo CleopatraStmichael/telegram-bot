@@ -3,3 +3,4 @@ groq
 python-dotenv
 gspread
 reportlab
+python-telegram-bot[job-queue]
